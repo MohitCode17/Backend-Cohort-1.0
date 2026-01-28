@@ -7,9 +7,11 @@ const PORT = 1337;
 async function startChat() {
   let isAuthenticated = false;
   let isJoined = false;
+
   /**
    * Using CLI Based User Interface
    */
+
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -17,58 +19,51 @@ async function startChat() {
   });
 
   /**
-   * Protocol Flow
-   * 1. Open a TCP Connection
+   * Open a TCP Connection
    */
-  const client = net.createConnection({ host: HOST, port: PORT }, () => {
-    console.log("Connected to the server");
-  });
+  const client = net.createConnection({ host: HOST, port: PORT }, () =>
+    console.log(`Connected to the TCP Server.`),
+  );
 
   /**
-   * Get username and token
+   * Received Username and Token from User
    */
   const username = await rl.question("Enter username: ");
   const token = await rl.question("Enter token: ");
 
   /**
-   * Prepare AUTH Command
+   * Build the AUTH Command and Send to Server
    */
   const authCommand = buildCommand(
     "AUTH",
     {
       User: username,
       Token: token,
-      "content-length": 0,
+      "Content-Length": 0,
     },
     "",
   );
 
   /**
-   * Send Command to Server
+   * Send Command To Server
    */
   client.write(authCommand);
 
-  /**
-   * Event: When data received data from server
-   * Server response for Auth/JOIN/SEND/LEAVE
-   */
   client.on("data", (data) => {
     const response = data.toString();
-    console.log(response);
 
     const type = getResponseType(response);
     const responseFor = getResponseFor(response);
 
-    // AUTH success
+    /**
+     * If Auth Success, Send the JOIN command
+     */
     if (type === "OK" && responseFor === "AUTH") {
       isAuthenticated = true;
 
       const joinCommand = buildCommand(
         "JOIN",
-        {
-          User: username,
-          "Content-Length": 0,
-        },
+        { User: username, "Content-Length": 0 },
         "",
       );
 
@@ -76,33 +71,46 @@ async function startChat() {
       return;
     }
 
-    // JOIN success
+    /**
+     * If Join Success
+     */
     if (type === "OK" && responseFor === "JOIN") {
       isJoined = true;
-      console.log("You have joined the chat 🎉");
+      console.log("You have joined the chat<�<�");
       rl.prompt();
       return;
     }
 
     if (type === "MESSAGE") {
-      const body = response.split("\r\n\r\n")[1];
-      console.log(body);
+      const [headerPart, body] = response.split("\r\n\r\n");
+      let sender = "Unknown";
+
+      const headerLines = headerPart.split("\r\n");
+
+      for (const line of headerLines) {
+        if (line.startsWith("User:")) {
+          sender = line.split(":")[1].trim();
+        }
+      }
+
+      console.log(`${sender}: ${body}`);
       rl.prompt();
       return;
     }
 
-    // ERROR handling
     if (type === "ERROR") {
-      console.log("Server error, closing connection");
+      console.error("Server error, closing connection");
       client.end();
     }
   });
 
+  /**
+   * line event fire when User Press "ENTER".
+   */
   rl.on("line", (line) => {
-    const input = line.trim();
+    const message = line.trim();
 
-    // LEAVE command
-    if (input === "/leave") {
+    if (message === "/leave") {
       const leaveCommand = buildCommand("LEAVE", { "Content-Length": 0 }, "");
 
       client.write(leaveCommand);
@@ -111,14 +119,16 @@ async function startChat() {
       return;
     }
 
-    // Jab tak JOIN na ho, SEND allow nahi
+    if (!isAuthenticated) {
+      console.log("Please authenticate first.");
+      return;
+    }
+
     if (!isJoined) {
       console.log("You are not joined yet.");
       rl.prompt();
       return;
     }
-
-    const message = line.trim();
 
     if (!message) {
       rl.prompt();
@@ -127,9 +137,7 @@ async function startChat() {
 
     const sendCommand = buildCommand(
       "SEND",
-      {
-        "Content-Length": Buffer.byteLength(message, "utf8"),
-      },
+      { "Content-Length": Buffer.byteLength(message, "utf8") },
       message,
     );
 
@@ -138,15 +146,16 @@ async function startChat() {
   });
 }
 
+/**
+ * Build Commands For: AUTH/JOIN/SEND/LEAVE
+ * CHAT/1.0 <COMMAND>
+ * Header1: Value1
+ * Header2: Value2
+ * Content-Length: 0
+ *
+ * body
+ */
 function buildCommand(command, headers, body) {
-  /*
-   * CHAT/1.0 AUTH
-   * User: alice
-   * Token: secret123
-   * Content-Length: 0
-   *
-   * body
-   */
   const startLine = `CHAT/1.0 ${command}`;
   const headerLines = [];
 
@@ -158,12 +167,19 @@ function buildCommand(command, headers, body) {
   return `${startLine}\r\n${headerLines.join("\r\n")}\r\n\r\n${body}`;
 }
 
+/**
+ * Extract the response type from response body
+ * type: OK/ERROR/MESSAGE
+ */
 function getResponseType(response) {
   const lines = response.split("\r\n");
-  const firstLine = lines[0]; // CHAT/1.0 OK / ERROR / MESSAGE
+  const firstLine = lines[0];
   return firstLine.split(" ")[1];
 }
 
+/**
+ * Extract the response-for from response body
+ */
 function getResponseFor(response) {
   const lines = response.split("\r\n");
   for (const line of lines) {

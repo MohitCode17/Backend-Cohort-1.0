@@ -10,92 +10,114 @@ const server = net.createServer((socket) => {
   socket.setEncoding("utf-8");
 
   /**
-   * Maintained State
+   * Maintain Socket-level Buffer
+   */
+  socket.buffer = "";
+
+  /**
+   * Maintaine State
    */
   socket.authenticated = false;
   socket.joined = false;
   socket.username = "";
 
-  console.log("New client connected...");
   clients.push(socket);
 
-  /**
-   * Event: Data received from client
-   */
-  socket.on("data", (data) => {
-    const message = parseMessage(data);
-
-    if (!message) {
-      console.error("Invalid message format");
-      return;
-    }
-
-    handleMessage(socket, message);
+  socket.on("data", (chunk) => {
+    socket.buffer += chunk;
+    parseBuffer(socket);
   });
 
-  // When the client disconnects
+  /**
+   * When client disconnect
+   */
   socket.on("end", () => {
     removeClient(socket);
-    console.log("Client disconnected");
   });
 
-  // Handle any errors
   socket.on("error", (err) => {
     console.error("Socket error:", err);
   });
 });
 
 /**
- *   CHAT/1.0 AUTH
- *   User: Alice
- *   Token: secret123
- *   Content-Length: 0
- *
- *   body
+ * Process Buffer Safely
+ * We Loop not parse once
+ * Fixes: Multiple messages in one TCP chunk
  */
-function parseMessage(message) {
-  // Split the Header and Body
-  const parts = message.split("\r\n\r\n");
-  if (parts.length < 2) return null; // Missing Body
+function parseBuffer(socket) {
+  while (true) {
+    const message = tryParseMessage(socket);
 
-  const headerPart = parts[0];
-  const bodyPart = parts[1];
+    if (!message) break; // Wait for more data
 
-  const headerLine = headerPart.split("\r\n");
+    handleMessage(socket, message);
+  }
+}
 
-  if (headerLine.length === 0) return null;
+function tryParseMessage(socket) {
+  const buffer = socket.buffer;
+  /**
+   * Look for header body separator
+   * Because header can arrive in pieces:
+   * Chunk 1: CHAT/1.0 AUTH\r\nUser:Mo
+   * Chunk 2: hit\r\nToken:secret123\r\n\r\n
+   */
+  const headerEndIndex = buffer.indexOf("\r\n\r\n");
+  if (headerEndIndex === -1) {
+    return null; // headers not complete yet
+  }
 
-  const firstLine = headerLine[0].split(" ");
-  if (firstLine.length < 2) return null;
+  const headerPart = buffer.slice(0, headerEndIndex);
+  const lines = headerPart.split("\r\n");
 
-  const protocolVersion = firstLine[0];
-  const command = firstLine[1];
+  // Parse start line
+  const [protocolVersion, command] = lines[0].split(" ");
+  if (!protocolVersion || !command) {
+    throw new Error("Invalid start line");
+  }
 
+  // Parse headers
   const headers = {};
   let contentLength = 0;
 
-  for (let i = 1; i < headerLine.length; i++) {
-    const line = headerLine[i];
-    const [key, value] = line.split(":");
-    headers[key.trim()] = value.trim();
+  for (let i = 1; i < lines.length; i++) {
+    const index = lines[i].indexOf(":");
+    if (index === -1) continue;
 
-    if (key.trim().toLowerCase() === "content-length") {
-      contentLength = parseInt(value.trim(), 10);
+    const key = lines[i].slice(0, index).trim();
+    const value = lines[i].slice(index + 1).trim();
+
+    headers[key] = value;
+
+    if (key.toLowerCase() === "content-length") {
+      contentLength = parseInt(value, 10);
     }
   }
 
-  // Optional Check
-  if (bodyPart.length !== contentLength) {
-    console.warn(
-      `Warning: body length ${bodyPart.length} does not match content length header.`,
-    );
+  // Check if full body has arrived
+  const totalMessageLength = headerEndIndex + 4 + contentLength;
+
+  if (buffer.length < totalMessageLength) {
+    return null; // body incomplete
   }
 
-  return { protocolVersion, command, headers, bodyPart };
+  // Extract body
+  const body = buffer.slice(headerEndIndex + 4, totalMessageLength);
+
+  // Remove consumed message from buffer
+  socket.buffer = buffer.slice(totalMessageLength);
+
+  return {
+    protocolVersion,
+    command,
+    headers,
+    body,
+  };
 }
 
 /**
- * Dispatches the message to the appropriate handler.
+ * Dispatch the message to the appropriate handler
  */
 function handleMessage(socket, message) {
   switch (message.command) {
@@ -103,7 +125,7 @@ function handleMessage(socket, message) {
       handleAuth(socket, message);
       break;
     case "JOIN":
-      handleJoin(socket, message);
+      handleJoin(socket);
       break;
     case "SEND":
       handleSend(socket, message);
@@ -114,6 +136,9 @@ function handleMessage(socket, message) {
   }
 }
 
+/**
+ * Handle AUTH Logic and Send Success if AUTHENTICATED
+ */
 function handleAuth(socket, message) {
   const user = message.headers["User"];
   const token = message.headers["Token"];
@@ -122,9 +147,23 @@ function handleAuth(socket, message) {
     socket.authenticated = true;
     socket.username = user;
 
+    /**
+     * Send Success Response to Client
+     * CHAT/1.0 OK
+     * Response-For: AUTH
+     * Content-Length: 0
+     */
     socket.write(formatResponse("OK", "AUTH", { "Content-Length": 0 }, ""));
-    console.log(`User ${user} authenticated successfully.`);
+
+    // console.log(`${user} is authenticated succcessfully.`);
   } else {
+    /**
+     * Send Error Response to Client
+     * CHAT/1.0 ERROR
+     * Response-For: AUTH
+     * Error: Not authenticated
+     * Content-Length: 0
+     */
     socket.write(
       formatResponse(
         "ERROR",
@@ -133,12 +172,15 @@ function handleAuth(socket, message) {
         "",
       ),
     );
-    console.log(`Authentication failed for user ${user || "unknown"}.`);
+    // console.error(`Authencation failed for user ${user || "Unknown"}`);
     socket.end();
   }
 }
 
-function handleJoin(socket, message) {
+/**
+ * Handle JOIN Logic
+ */
+function handleJoin(socket) {
   if (!socket.authenticated) {
     socket.write(
       formatResponse(
@@ -153,14 +195,21 @@ function handleJoin(socket, message) {
   if (!socket.joined) {
     socket.joined = true;
     socket.write(formatResponse("OK", "JOIN", { "Content-Length": 0 }, ""));
+
+    /**
+     * Notification Broadcast
+     * Like: <User> has joined the chat...
+     */
     broadcast(
       createServerMessage(`${socket.username} has joined the chat.`, "JOIN"),
       socket,
     );
-    console.log(`User ${socket.username} joined the chat.`);
   }
 }
 
+/**
+ * Handle SEND Logic
+ */
 function handleSend(socket, message) {
   if (!socket.authenticated || !socket.joined) {
     socket.write(
@@ -174,9 +223,9 @@ function handleSend(socket, message) {
     return;
   }
 
-  const body = message.bodyPart;
+  const body = message.body;
 
-  const broadcastMsg = formatResponse(
+  const broadCastMsg = formatResponse(
     "MESSAGE",
     "SEND",
     { "Content-Length": Buffer.byteLength(body, "utf8") },
@@ -184,10 +233,12 @@ function handleSend(socket, message) {
     socket.username,
   );
 
-  broadcast(broadcastMsg, socket);
-  console.log(`Broadcasting message from ${socket.username}: ${body}`);
+  broadcast(broadCastMsg, socket);
 }
 
+/**
+ * Handle LEAVE Logic
+ */
 function handleLeave(socket, message) {
   if (socket.joined) {
     socket.joined = false;
@@ -196,7 +247,6 @@ function handleLeave(socket, message) {
       createServerMessage(`${socket.username} has left the chat.`, "LEAVE"),
       socket,
     );
-    console.log(`User ${socket.username} left the chat.`);
     socket.end();
   } else {
     socket.write(
@@ -211,16 +261,15 @@ function handleLeave(socket, message) {
 }
 
 /**
- * Formats a response message.
- * type: OK, ERROR, or MESSAGE.
- * responseFor: The command this response is for.
- * headers: Additional headers as an object.
- * body: Message body.
- * user (optional): For MESSAGE responses, the sender's username.
+ * Format a response message for client
+ * Type: OK, ERROR, MESSAGE
+ * Response-For: The command this response is for
+ * Headers: Additional headers as an object
+ * Body: Message body
+ * user: (Optional) For Message responses, the sender's username
  */
 function formatResponse(type, responseFor, headers, body, user) {
-  let startLine = `CHAT/1.0 ${type}`;
-
+  const startLine = `CHAT/1.0 ${type}`;
   const headerLines = [];
 
   headerLines.push(`Response-For: ${responseFor}`);
@@ -237,7 +286,7 @@ function formatResponse(type, responseFor, headers, body, user) {
 }
 
 /**
- * Creates a server-generated message.
+ * Design the format of server generated messages.
  */
 function createServerMessage(text, responseFor) {
   return formatResponse(
@@ -250,7 +299,7 @@ function createServerMessage(text, responseFor) {
 }
 
 /**
- * Broadcasts a message to all connected clients (except the sender).
+ * Broadcast the messages to all connected clients except the sender
  */
 function broadcast(message, senderSocket) {
   clients.forEach((client) => {
@@ -270,6 +319,4 @@ function removeClient(socket) {
   }
 }
 
-server.listen(PORT, () => {
-  console.log(`server listening on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Server listening on port: ${PORT}`));
